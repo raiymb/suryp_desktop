@@ -30,6 +30,14 @@ interface UserFolders {
   home: string | null
 }
 
+interface Stats {
+  files_sorted_today: number
+  files_sorted_this_week: number
+  files_sorted_this_month: number
+  total_files_sorted: number
+  rules_count: number
+}
+
 interface ScannedFile {
   filename: string
   extension: string
@@ -91,10 +99,12 @@ function Dashboard({ status, onTogglePause, onOpenDashboard }: DashboardProps) {
   const [customPrompt, setCustomPrompt] = useState('')
   const [suggestedRules, setSuggestedRules] = useState<SuggestedRule[]>([])
   const [showRulesModal, setShowRulesModal] = useState(false)
+  const [stats, setStats] = useState<Stats | null>(null)
 
   useEffect(() => {
     loadRecentActions()
     loadUserFolders()
+    loadStats()
   }, [])
 
   const loadRecentActions = async () => {
@@ -114,6 +124,26 @@ function Dashboard({ status, onTogglePause, onOpenDashboard }: DashboardProps) {
       setUserFolders(folders)
     } catch (error) {
       console.error('Failed to load user folders:', error)
+    }
+  }
+
+  const loadStats = async () => {
+    try {
+      const accessToken = await invoke<string | null>('get_access_token')
+      if (!accessToken) return
+      
+      const response = await httpFetch<Stats>(`${API_URL}/api/user/stats`, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${accessToken}`
+        }
+      })
+      
+      if (response.ok) {
+        setStats(response.data)
+      }
+    } catch (error) {
+      console.error('Failed to load stats:', error)
     }
   }
 
@@ -418,20 +448,20 @@ function Dashboard({ status, onTogglePause, onOpenDashboard }: DashboardProps) {
       {/* Stats */}
       <div className="card">
         <div className="card-header">
-          <span className="card-title">Статистика за сегодня</span>
+          <span className="card-title">Статистика</span>
         </div>
         <div className="stats-grid">
           <div className="stat-item">
-            <div className="stat-value">{status.files_today}</div>
-            <div className="stat-label">Файлов</div>
+            <div className="stat-value">{stats?.files_sorted_today || 0}</div>
+            <div className="stat-label">Сегодня</div>
           </div>
           <div className="stat-item">
-            <div className="stat-value">{status.watched_folders.length}</div>
-            <div className="stat-label">Папок</div>
+            <div className="stat-value">{stats?.files_sorted_this_week || 0}</div>
+            <div className="stat-label">Неделя</div>
           </div>
           <div className="stat-item">
-            <div className="stat-value">{status.is_paused ? '⏸️' : '▶️'}</div>
-            <div className="stat-label">{status.is_paused ? 'Пауза' : 'Активен'}</div>
+            <div className="stat-value">{stats?.total_files_sorted || 0}</div>
+            <div className="stat-label">Всего</div>
           </div>
         </div>
       </div>
@@ -452,23 +482,41 @@ function Dashboard({ status, onTogglePause, onOpenDashboard }: DashboardProps) {
           </button>
         ) : organizeStep === 'preview' && organizeResult ? (
           // Preview results
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-            <div style={{ fontSize: '0.8rem', color: '#a78bfa', fontWeight: 500 }}>
-              {organizeResult.total_files} файлов → {organizeResult.total_folders} папок
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+            <div style={{ 
+              display: 'flex', 
+              alignItems: 'center', 
+              justifyContent: 'space-between',
+              padding: '0.75rem 1rem',
+              background: 'linear-gradient(135deg, rgba(99, 102, 241, 0.15), rgba(139, 92, 246, 0.1))',
+              borderRadius: '12px',
+              border: '1px solid rgba(99, 102, 241, 0.2)'
+            }}>
+              <span style={{ fontSize: '0.85rem', fontWeight: 600, color: '#a78bfa' }}>
+                📊 {organizeResult.total_files} файлов
+              </span>
+              <span style={{ fontSize: '0.75rem', color: '#9ca3af' }}>→</span>
+              <span style={{ fontSize: '0.85rem', fontWeight: 600, color: '#10b981' }}>
+                📁 {organizeResult.total_folders} папок
+              </span>
             </div>
-            <div style={{ maxHeight: '150px', overflow: 'auto' }}>
+            <div style={{ maxHeight: '180px', overflow: 'auto', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
               {organizeResult.folders.map((folder, i) => (
-                <div key={i} style={{ 
-                  padding: '0.5rem', 
-                  background: 'rgba(0,0,0,0.2)', 
-                  borderRadius: '0.5rem',
-                  marginBottom: '0.25rem',
-                  fontSize: '0.75rem'
-                }}>
-                  <div style={{ fontWeight: 500, color: '#a78bfa' }}>📁 {folder.folder_path}</div>
-                  <div style={{ color: '#9ca3af' }}>
-                    {folder.files.slice(0, 3).join(', ')}
-                    {folder.files.length > 3 && ` +${folder.files.length - 3}`}
+                <div key={i} className="preview-folder">
+                  <div className="preview-folder-header">
+                    <span className="preview-folder-icon">📁</span>
+                    <span className="preview-folder-name">{folder.folder_path}</span>
+                    <span className="preview-folder-count">{folder.files.length}</span>
+                  </div>
+                  <div className="preview-files">
+                    {folder.files.slice(0, 4).map((file, j) => (
+                      <span key={j} className="preview-file">{file}</span>
+                    ))}
+                    {folder.files.length > 4 && (
+                      <span className="preview-file" style={{ background: 'rgba(99, 102, 241, 0.2)', color: '#a78bfa' }}>
+                        +{folder.files.length - 4} ещё
+                      </span>
+                    )}
                   </div>
                 </div>
               ))}
