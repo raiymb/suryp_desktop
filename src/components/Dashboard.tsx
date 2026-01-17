@@ -51,7 +51,25 @@ interface OrganizeResult {
   folders: FolderSuggestion[]
   total_files: number
   total_folders: number
+  clustering_method: string
   naming_method: string
+}
+
+interface ExistingFolder {
+  folder_name: string
+  folder_path: string
+  sample_files: string[]
+  file_count: number
+}
+
+interface SuggestedRule {
+  rule_type: string
+  pattern: string
+  target_folder: string
+  file_count: number
+  confidence: number
+  description: string
+  selected?: boolean
 }
 
 type OrganizeStep = 'idle' | 'scanning' | 'analyzing' | 'preview' | 'executing' | 'done'
@@ -68,6 +86,11 @@ function Dashboard({ status, onTogglePause, onOpenDashboard }: DashboardProps) {
   const [organizeResult, setOrganizeResult] = useState<OrganizeResult | null>(null)
   const [useGeminiNaming, setUseGeminiNaming] = useState(true)
   const [useGeminiFull, setUseGeminiFull] = useState(false)
+  const [useExistingFolders, setUseExistingFolders] = useState(true)
+  const [useContentExtraction, setUseContentExtraction] = useState(false)
+  const [customPrompt, setCustomPrompt] = useState('')
+  const [suggestedRules, setSuggestedRules] = useState<SuggestedRule[]>([])
+  const [showRulesModal, setShowRulesModal] = useState(false)
 
   useEffect(() => {
     loadRecentActions()
@@ -125,6 +148,12 @@ function Dashboard({ status, onTogglePause, onOpenDashboard }: DashboardProps) {
         return
       }
       
+      if (files.length > 5000) {
+        setOrganizeStatus(`❌ Слишком много файлов (${files.length}). Максимум 5000.`)
+        setOrganizeStep('idle')
+        return
+      }
+      
       setScannedFiles(files)
       setOrganizeStatus(`Найдено ${files.length} файлов. AI анализ...`)
       setOrganizeStep('analyzing')
@@ -137,15 +166,76 @@ function Dashboard({ status, onTogglePause, onOpenDashboard }: DashboardProps) {
         setOrganizeStep('idle')
         return
       }
+      // Step 2: Scan existing folders if option enabled
+      let existingFolders: ExistingFolder[] = []
+      if (useExistingFolders) {
+        try {
+          existingFolders = await invoke<ExistingFolder[]>('scan_existing_folders', { folderPath: selectedFolder })
+          setOrganizeStatus(`Найдено ${files.length} файлов, ${existingFolders.length} папок. AI анализ...`)
+        } catch (e) {
+          console.warn('Failed to scan existing folders:', e)
+        }
+      }
       
-      // Step 2: Call backend API for AI analysis
-      const filesForApi = files.map(f => ({
+      // Step 3: Extract content if enabled (OCR, PDF text, etc.)
+      let filesForApi = files.map(f => ({
         filename: f.filename,
         extension: f.extension,
         size_bytes: f.size_bytes,
-        content_preview: '', // Skip content extraction for speed
+        content_preview: '',
         path: f.path
       }))
+      
+      if (useContentExtraction) {
+        setOrganizeStatus(`Извлечение содержимого (0/${files.length})...`)
+        
+        // Process files in parallel (max 5 at a time)
+        const batchSize = 5
+        for (let i = 0; i < files.length; i += batchSize) {
+          const batch = files.slice(i, i + batchSize)
+          
+          await Promise.all(batch.map(async (file, batchIdx) => {
+            const fileIdx = i + batchIdx
+            try {
+              // Read first 50KB of file
+              const content = await invoke<number[]>('read_file_content', { 
+                filePath: file.path, 
+                maxBytes: 50000 
+              })
+              
+              if (content.length > 0) {
+                // Convert to base64
+                const bytes = new Uint8Array(content)
+                const base64 = btoa(String.fromCharCode(...bytes))
+                
+                // Send to backend for extraction
+                const extractResponse = await httpFetch<{ content_preview: string }>(`${API_URL}/api/auto-organize/extract-content`, {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${accessToken || ''}`
+                  },
+                  body: Body.json({
+                    content_base64: base64,
+                    extension: file.extension,
+                    filename: file.filename
+                  })
+                })
+                
+                if (extractResponse.ok && extractResponse.data.content_preview) {
+                  filesForApi[fileIdx].content_preview = extractResponse.data.content_preview
+                }
+              }
+            } catch (e) {
+              console.warn(`Failed to extract content from ${file.filename}:`, e)
+            }
+          }))
+          
+          setOrganizeStatus(`Извлечение содержимого (${Math.min(i + batchSize, files.length)}/${files.length})...`)
+        }
+        
+        setOrganizeStatus(`Анализ ${files.length} файлов...`)
+      }
       
       const response = await httpFetch<OrganizeResult>(`${API_URL}/api/auto-organize/analyze`, {
         method: 'POST',
@@ -155,8 +245,16 @@ function Dashboard({ status, onTogglePause, onOpenDashboard }: DashboardProps) {
         },
         body: Body.json({
           files: filesForApi,
+          existing_folders: existingFolders.map(f => ({
+            folder_name: f.folder_name,
+            folder_path: f.folder_path,
+            sample_files: f.sample_files,
+            file_count: f.file_count
+          })),
+          use_existing_folders: useExistingFolders,
           use_gemini_naming: useGeminiNaming,
           use_gemini_full: useGeminiFull,
+          custom_prompt: customPrompt,
           min_clusters: 3,
           max_clusters: 15
         })
@@ -250,6 +348,42 @@ function Dashboard({ status, onTogglePause, onOpenDashboard }: DashboardProps) {
     }
   }
 
+  const handleGenerateRules = async () => {
+    if (!organizeResult) return
+    
+    try {
+      const accessToken = await invoke<string | null>('get_access_token')
+      
+      const response = await httpFetch<{ rules: SuggestedRule[], total_rules: number }>(`${API_URL}/api/auto-organize/generate-rules`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${accessToken || ''}`
+        },
+        body: Body.json({
+          folders: organizeResult.folders.map(f => ({
+            folder_path: f.folder_path,
+            folder_name: f.folder_name,
+            files: f.files,
+            reason: f.reason,
+            confidence: f.confidence,
+            file_count: f.file_count
+          })),
+          source_folder: selectedFolder
+        })
+      })
+      
+      if (response.ok && response.data.rules.length > 0) {
+        setSuggestedRules(response.data.rules.map(r => ({ ...r, selected: true })))
+        setShowRulesModal(true)
+      } else {
+        setOrganizeStatus('Не удалось найти паттерны для правил')
+      }
+    } catch (error: any) {
+      console.error('Failed to generate rules:', error)
+    }
+  }
+
   const resetOrganize = () => {
     setShowAutoOrganize(false)
     setSelectedFolder('')
@@ -257,6 +391,8 @@ function Dashboard({ status, onTogglePause, onOpenDashboard }: DashboardProps) {
     setOrganizeStatus('')
     setScannedFiles([])
     setOrganizeResult(null)
+    setSuggestedRules([])
+    setShowRulesModal(false)
   }
 
   const formatTime = (dateString: string) => {
@@ -355,9 +491,103 @@ function Dashboard({ status, onTogglePause, onOpenDashboard }: DashboardProps) {
           <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', alignItems: 'center' }}>
             <div style={{ fontSize: '2rem' }}>🎉</div>
             <div style={{ fontSize: '0.8rem', color: '#10b981' }}>{organizeStatus}</div>
-            <button className="btn btn-primary" onClick={resetOrganize}>
-              Готово
-            </button>
+            <div style={{ display: 'flex', gap: '0.5rem', width: '100%' }}>
+              <button className="btn btn-secondary" onClick={handleGenerateRules} style={{ flex: 1 }}>
+                🔧 Создать правила
+              </button>
+              <button className="btn btn-primary" onClick={resetOrganize} style={{ flex: 1 }}>
+                Готово
+              </button>
+            </div>
+            
+            {/* Rules Modal */}
+            {showRulesModal && (
+              <div style={{
+                position: 'absolute',
+                top: 0,
+                left: 0,
+                right: 0,
+                bottom: 0,
+                background: 'rgba(0,0,0,0.8)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                zIndex: 100
+              }}>
+                <div style={{
+                  background: '#1f2937',
+                  borderRadius: '1rem',
+                  padding: '1rem',
+                  maxWidth: '90%',
+                  maxHeight: '80%',
+                  overflow: 'auto'
+                }}>
+                  <h3 style={{ margin: '0 0 0.5rem', fontSize: '1rem' }}>🔧 Предложенные правила</h3>
+                  <p style={{ fontSize: '0.7rem', color: '#9ca3af', margin: '0 0 0.5rem' }}>
+                    Выберите правила для автоматической сортировки новых файлов:
+                  </p>
+                  
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem', marginBottom: '0.5rem' }}>
+                    {suggestedRules.map((rule, idx) => (
+                      <label key={idx} style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.5rem',
+                        padding: '0.4rem',
+                        background: 'rgba(0,0,0,0.2)',
+                        borderRadius: '0.5rem',
+                        cursor: 'pointer',
+                        fontSize: '0.75rem'
+                      }}>
+                        <input
+                          type="checkbox"
+                          checked={rule.selected}
+                          onChange={() => {
+                            setSuggestedRules(prev => prev.map((r, i) => 
+                              i === idx ? { ...r, selected: !r.selected } : r
+                            ))
+                          }}
+                          style={{ accentColor: '#10b981' }}
+                        />
+                        <span style={{ flex: 1 }}>{rule.description}</span>
+                        <span style={{ 
+                          fontSize: '0.6rem', 
+                          color: '#6b7280',
+                          background: 'rgba(0,0,0,0.3)',
+                          padding: '0.1rem 0.3rem',
+                          borderRadius: '0.25rem'
+                        }}>
+                          {rule.file_count} файлов
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                  
+                  <div style={{ display: 'flex', gap: '0.5rem' }}>
+                    <button 
+                      className="btn btn-secondary" 
+                      onClick={() => setShowRulesModal(false)}
+                      style={{ flex: 1 }}
+                    >
+                      Отмена
+                    </button>
+                    <button 
+                      className="btn btn-primary" 
+                      onClick={() => {
+                        // TODO: Save rules to backend
+                        const selectedRules = suggestedRules.filter(r => r.selected)
+                        console.log('Selected rules:', selectedRules)
+                        setShowRulesModal(false)
+                        setOrganizeStatus(`✅ Готово! Выбрано ${selectedRules.length} правил`)
+                      }}
+                      style={{ flex: 1, background: 'linear-gradient(135deg, #10b981, #3b82f6)' }}
+                    >
+                      💾 Сохранить ({suggestedRules.filter(r => r.selected).length})
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         ) : (
           // Selection / Loading state
@@ -430,12 +660,53 @@ function Dashboard({ status, onTogglePause, onOpenDashboard }: DashboardProps) {
                   <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
                     <input
                       type="checkbox"
+                      checked={useExistingFolders}
+                      onChange={(e) => setUseExistingFolders(e.target.checked)}
+                      style={{ accentColor: '#3b82f6' }}
+                    />
+                    <span style={{ fontSize: '0.7rem', color: '#d1d5db' }}>📁 Использовать существующие папки</span>
+                  </label>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+                    <input
+                      type="checkbox"
+                      checked={useContentExtraction}
+                      onChange={(e) => setUseContentExtraction(e.target.checked)}
+                      style={{ accentColor: '#f59e0b' }}
+                    />
+                    <span style={{ fontSize: '0.7rem', color: '#d1d5db' }}>🔍 OCR и извлечение текста</span>
+                  </label>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+                    <input
+                      type="checkbox"
                       checked={useGeminiFull}
                       onChange={(e) => setUseGeminiFull(e.target.checked)}
                       style={{ accentColor: '#a855f7' }}
                     />
                     <span style={{ fontSize: '0.7rem', color: '#d1d5db' }}>🔮 Глубокий анализ (медленнее)</span>
                   </label>
+                </div>
+                
+                {/* Custom Prompt */}
+                <div style={{ marginTop: '0.5rem' }}>
+                  <label style={{ fontSize: '0.7rem', color: '#9ca3af', display: 'block', marginBottom: '0.25rem' }}>
+                    📝 Свои инструкции (необязательно):
+                  </label>
+                  <textarea
+                    value={customPrompt}
+                    onChange={(e) => setCustomPrompt(e.target.value)}
+                    placeholder="Например: Сортируй по проектам. Все документы с 'KBTU' в название папки Учёба/KBTU..."
+                    style={{
+                      width: '100%',
+                      minHeight: '50px',
+                      padding: '0.4rem',
+                      borderRadius: '0.5rem',
+                      border: '1px solid #374151',
+                      background: '#1f2937',
+                      color: 'white',
+                      fontSize: '0.7rem',
+                      resize: 'vertical'
+                    }}
+                  />
                 </div>
               </>
             )}

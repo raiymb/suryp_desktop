@@ -84,6 +84,7 @@ fn main() {
             stop_watching,
             // Auto-organize commands
             scan_folder_for_organize,
+            scan_existing_folders,
             read_file_content,
             execute_file_moves,
             get_user_folders,
@@ -322,6 +323,79 @@ fn stop_watching(state: tauri::State<AppState>) -> Result<(), String> {
 // ============================================
 // Auto-Organize Commands
 // ============================================
+
+#[derive(Debug, Serialize)]
+struct ExistingFolderInfo {
+    folder_name: String,
+    folder_path: String,
+    sample_files: Vec<String>,
+    file_count: usize,
+}
+
+/// Scan for existing subfolders and their contents
+#[tauri::command]
+async fn scan_existing_folders(folder_path: String) -> Result<Vec<ExistingFolderInfo>, String> {
+    let path = Path::new(&folder_path);
+    
+    if !path.exists() {
+        return Err(format!("Folder does not exist: {}", folder_path));
+    }
+    
+    let mut folders = Vec::new();
+    
+    let entries = fs::read_dir(path).map_err(|e| e.to_string())?;
+    
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let entry_path = entry.path();
+        
+        if !entry_path.is_dir() {
+            continue;
+        }
+        
+        let folder_name = entry_path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        
+        // Skip hidden folders
+        if folder_name.starts_with('.') {
+            continue;
+        }
+        
+        // Get sample files from folder (up to 10)
+        let mut sample_files = Vec::new();
+        let mut file_count = 0;
+        
+        if let Ok(sub_entries) = fs::read_dir(&entry_path) {
+            for sub_entry in sub_entries {
+                if let Ok(sub_entry) = sub_entry {
+                    let sub_path = sub_entry.path();
+                    if sub_path.is_file() {
+                        file_count += 1;
+                        if sample_files.len() < 10 {
+                            if let Some(name) = sub_path.file_name().and_then(|n| n.to_str()) {
+                                sample_files.push(name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Only include folders with files
+        if file_count > 0 {
+            folders.push(ExistingFolderInfo {
+                folder_name,
+                folder_path: entry_path.to_string_lossy().to_string(),
+                sample_files,
+                file_count,
+            });
+        }
+    }
+    
+    Ok(folders)
+}
 
 /// Scan a folder and return list of files with metadata
 #[tauri::command]
